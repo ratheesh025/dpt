@@ -9,24 +9,21 @@ on:
     branches:
       - main
 
-
 env:
-  REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/predicta-dbt
-
 
 jobs:
 
-  # =====================================================
-  # JOB 1 - TEST
-  # =====================================================
+  # ---------------------------------------------------------
+  # 1. DBT TEST
+  # ---------------------------------------------------------
   test:
     name: DBT Test
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -37,29 +34,40 @@ jobs:
       - name: Install DBT
         run: |
           python -m pip install --upgrade pip
-          pip install dbt-core dbt-clickhouse
+          pip install -r requirements.txt
 
-      - name: Check DBT
+      - name: DBT Version
         run: |
           dbt --version
 
-      - name: DBT Parse
+      - name: DBT Debug
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
         run: |
-          cd dbt
-          dbt parse
+          dbt debug --profiles-dir .
+
+      - name: DBT Compile
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+        run: |
+          dbt compile --profiles-dir .
 
 
-  # =====================================================
-  # JOB 2 - BUILD AND PUSH TO GITHUB CONTAINER REGISTRY
-  # =====================================================
-  build-and-push:
-    name: Build and Push Image
-    runs-on: ubuntu-latest
-
-    needs:
-      - test
-
+  # ---------------------------------------------------------
+  # 2. BUILD AND PUSH DOCKER IMAGE
+  # ---------------------------------------------------------
+  build:
+    name: Build and Push DBT Image
+    needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
 
     permissions:
       contents: read
@@ -67,65 +75,156 @@ jobs:
 
     steps:
 
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Login to GitHub Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set image tag
+        id: image
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build Docker image
         run: |
           docker build \
-            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.image.outputs.tag }} \
             -t ${{ env.IMAGE_NAME }}:latest \
             .
 
-      - name: Push image with SHA tag
+      - name: Push Docker image
         run: |
-          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-      - name: Push latest image
-        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.image.outputs.tag }}
           docker push ${{ env.IMAGE_NAME }}:latest
 
 
-  # =====================================================
-  # JOB 3 - DEPLOY
-  # =====================================================
+  # ---------------------------------------------------------
+  # 3. DEPLOY TO KUBERNETES
+  # ---------------------------------------------------------
   deploy:
-    name: Deploy DBT
-    runs-on: self-hosted
-
-    needs:
-      - build-and-push
-
+    name: Deploy DBT to Kubernetes
+    needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
 
     steps:
 
-      - name: Login to GitHub Container Registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
-            -u "${{ github.actor }}" \
-            --password-stdin
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Pull DBT image
-        run: |
-          docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
 
-      - name: Run DBT
+      - name: Configure Kubernetes
         run: |
-          docker run --rm \
-            --network host \
-            -e CLICKHOUSE_HOST="${{ secrets.CLICKHOUSE_HOST }}" \
-            -e CLICKHOUSE_PORT="${{ secrets.CLICKHOUSE_PORT }}" \
-            -e CLICKHOUSE_USER="${{ secrets.CLICKHOUSE_USER }}" \
-            -e CLICKHOUSE_PASSWORD="${{ secrets.CLICKHOUSE_PASSWORD }}" \
-            -e CLICKHOUSE_SCHEMA="${{ secrets.CLICKHOUSE_SCHEMA }}" \
-            -e CLICKHOUSE_SECURE="${{ secrets.CLICKHOUSE_SECURE }}" \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            dbt run
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify Kubernetes connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create namespace if required
+        run: |
+          kubectl create namespace analytics \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create DBT ConfigMap
+        run: |
+          kubectl create configmap dbt-config \
+            -n analytics \
+            --from-file=dbt_project.yml \
+            --from-file=profiles.yml \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create DBT Secret
+        run: |
+          kubectl create secret generic dbt-clickhouse-secret \
+            -n analytics \
+            --from-literal=CLICKHOUSE_HOST="${{ secrets.CLICKHOUSE_HOST }}" \
+            --from-literal=CLICKHOUSE_PORT="${{ secrets.CLICKHOUSE_PORT }}" \
+            --from-literal=CLICKHOUSE_USER="${{ secrets.CLICKHOUSE_USER }}" \
+            --from-literal=CLICKHOUSE_PASSWORD="${{ secrets.CLICKHOUSE_PASSWORD }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create DBT Job
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: dbt-run-${GITHUB_SHA::7}
+            namespace: analytics
+          spec:
+            backoffLimit: 2
+            ttlSecondsAfterFinished: 86400
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: dbt
+                    image: ghcr.io/${{ github.repository_owner }}/predicta-dbt:${GITHUB_SHA::7}
+                    imagePullPolicy: Always
+                    env:
+                      - name: CLICKHOUSE_HOST
+                        valueFrom:
+                          secretKeyRef:
+                            name: dbt-clickhouse-secret
+                            key: CLICKHOUSE_HOST
+
+                      - name: CLICKHOUSE_PORT
+                        valueFrom:
+                          secretKeyRef:
+                            name: dbt-clickhouse-secret
+                            key: CLICKHOUSE_PORT
+
+                      - name: CLICKHOUSE_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: dbt-clickhouse-secret
+                            key: CLICKHOUSE_USER
+
+                      - name: CLICKHOUSE_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: dbt-clickhouse-secret
+                            key: CLICKHOUSE_PASSWORD
+
+                    command:
+                      - dbt
+                    args:
+                      - build
+                      - --profiles-dir
+                      - /app
+          EOF
+
+      - name: Wait for DBT Job
+        run: |
+          kubectl wait \
+            --for=condition=complete \
+            job/dbt-run-${GITHUB_SHA::7} \
+            -n analytics \
+            --timeout=10m
+
+      - name: Show DBT logs
+        if: always()
+        run: |
+          kubectl logs \
+            job/dbt-run-${GITHUB_SHA::7} \
+            -n analytics \
+            --all-containers=true
