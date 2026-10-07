@@ -1,13 +1,25 @@
-predicta_dbt:
-  target: dev
+name: predicta_dbt
+version: "1.0.0"
+config-version: 2
 
-  outputs:
-    dev:
-      type: clickhouse
-      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
-      port: "{{ env_var('CLICKHOUSE_PORT', '8123') }}"
-      user: "{{ env_var('CLICKHOUSE_USER', 'default') }}"
-      password: "{{ env_var('CLICKHOUSE_PASSWORD', '') }}"
-      schema: "{{ env_var('CLICKHOUSE_SCHEMA', 'default') }}"
-      secure: "{{ env_var('CLICKHOUSE_SECURE', 'false') | as_bool }}"
-      threads: 4
+profile: predicta_dbt
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+  - "logs"
+
+models:
+  predicta_dbt:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table

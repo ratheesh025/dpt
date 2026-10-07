@@ -1,0 +1,131 @@
+name: DBT CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/predicta-dbt
+
+
+jobs:
+
+  # =====================================================
+  # JOB 1 - TEST
+  # =====================================================
+  test:
+    name: DBT Test
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install DBT
+        run: |
+          python -m pip install --upgrade pip
+          pip install dbt-core dbt-clickhouse
+
+      - name: Check DBT
+        run: |
+          dbt --version
+
+      - name: DBT Parse
+        run: |
+          cd dbt
+          dbt parse
+
+
+  # =====================================================
+  # JOB 2 - BUILD AND PUSH TO GITHUB CONTAINER REGISTRY
+  # =====================================================
+  build-and-push:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+
+    needs:
+      - test
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push image with SHA tag
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Push latest image
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:latest
+
+
+  # =====================================================
+  # JOB 3 - DEPLOY
+  # =====================================================
+  deploy:
+    name: Deploy DBT
+    runs-on: self-hosted
+
+    needs:
+      - build-and-push
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+
+      - name: Login to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Pull DBT image
+        run: |
+          docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Run DBT
+        run: |
+          docker run --rm \
+            --network host \
+            -e CLICKHOUSE_HOST="${{ secrets.CLICKHOUSE_HOST }}" \
+            -e CLICKHOUSE_PORT="${{ secrets.CLICKHOUSE_PORT }}" \
+            -e CLICKHOUSE_USER="${{ secrets.CLICKHOUSE_USER }}" \
+            -e CLICKHOUSE_PASSWORD="${{ secrets.CLICKHOUSE_PASSWORD }}" \
+            -e CLICKHOUSE_SCHEMA="${{ secrets.CLICKHOUSE_SCHEMA }}" \
+            -e CLICKHOUSE_SECURE="${{ secrets.CLICKHOUSE_SECURE }}" \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            dbt run
