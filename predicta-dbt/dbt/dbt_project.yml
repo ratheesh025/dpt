@@ -1,0 +1,13 @@
+predicta_dbt:
+  target: dev
+
+  outputs:
+    dev:
+      type: clickhouse
+      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'default') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', '') }}"
+      schema: "{{ env_var('CLICKHOUSE_SCHEMA', 'default') }}"
+      secure: "{{ env_var('CLICKHOUSE_SECURE', 'false') | as_bool }}"
+      threads: 4
